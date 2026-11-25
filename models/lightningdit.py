@@ -283,6 +283,12 @@ class LightningDiT(nn.Module):
         self.auxiliary_time_cond = auxiliary_time_cond
         self.r_embedder = TimestepEmbedder(hidden_size) if auxiliary_time_cond else None
 
+        # Memoized dynamic-RoPE closures (see _get_dynamic_rope). Tiled and video
+        # inference reuse the same square tile geometry many times per run -- a
+        # 2048px output is 20+ tiles -- and the tensors depend only on
+        # (seq_len, device, dtype), so rebuilding them per call is pure waste.
+        self._rope_cache = {}
+
     def unpatchify(self, x):
         c = self.out_channels
         p = self.x_embedder.patch_size[0]
@@ -295,6 +301,11 @@ class LightningDiT(nn.Module):
     def _get_dynamic_rope(self, hw_seq_len, device, dtype):
         if not self.use_rope:
             return None
+
+        cache_key = (int(hw_seq_len), device.type, device.index, dtype)
+        cached = self._rope_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         half_head_dim = self.hidden_size // self.num_heads // 2
         pt_seq_len = self.x_embedder.img_size[0] // self.patch_size
@@ -315,6 +326,11 @@ class LightningDiT(nn.Module):
         def dynamic_rope_fn(t_input):
             return t_input * freqs_cos + rotate_half(t_input) * freqs_sin
 
+        # Bound the map: a tile-size sweep would otherwise keep every past
+        # geometry's tensors alive for the lifetime of the model.
+        if len(self._rope_cache) >= 4:
+            self._rope_cache.clear()
+        self._rope_cache[cache_key] = dynamic_rope_fn
         return dynamic_rope_fn
 
     def forward_flexible(self, x, t, r=None, z=None):

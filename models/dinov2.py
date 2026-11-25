@@ -114,6 +114,11 @@ class DinoVisionTransformer(nn.Module):
         self.blocks = nn.ModuleList([Block(embed_dim, num_heads, mlp_ratio) for _ in range(depth)])
         self.norm = ops.LayerNorm(embed_dim, eps=1e-6)
 
+        # Memoized bicubic resize of the patch position embeddings (see
+        # interpolate_pos_encoding). Every tile of every frame is interpolated to
+        # the same (w, h), so the resize result is recomputed for nothing.
+        self._pos_embed_cache = {}
+
     def interpolate_pos_encoding(self, x, w, h):
         """Vendored verbatim from facebookresearch/dinov2 (Apache-2.0): bicubic-resizes
         the patch position embeddings to the current (w, h) grid. The `+ 0.1` offset
@@ -125,6 +130,12 @@ class DinoVisionTransformer(nn.Module):
         N = self.pos_embed.shape[1] - 1
         if npatch == N and w == h:
             return self.pos_embed
+
+        cache_key = (int(w), int(h), previous_dtype, x.device.type, x.device.index)
+        cached = self._pos_embed_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
@@ -139,7 +150,12 @@ class DinoVisionTransformer(nn.Module):
         )
         assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        result = torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        # Bounded so a resolution sweep cannot keep every past grid resident.
+        if len(self._pos_embed_cache) >= 8:
+            self._pos_embed_cache.clear()
+        self._pos_embed_cache[cache_key] = result.detach()
+        return result
 
     def prepare_tokens(self, x):
         B, _, w, h = x.shape
